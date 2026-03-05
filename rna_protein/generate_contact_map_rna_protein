@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import pandas as pd
+from Bio import AlignIO
+from Bio.PDB import PDBParser
+from collections import defaultdict
+
+# --- USER PARAMETERS ---
+
+# Input files
+clustal_alignment_file = "clustal.aln"
+
+vc_rna_pdb = "vcmut_16srrna.pdb"
+vc_prot_pdb = "vcmut_rproteins.pdb"
+ec_rna_pdb = "vcst_16srrna.pdb"
+ec_prot_pdb = "vcst_rproteins.pdb"
+
+qscore_vc_rna_file = "vcs44_16srrna.txt"
+qscore_vc_prot_file = "vcs44_rproteins.txt"
+qscore_ec_rna_file = "vcst_16srrna.txt"
+qscore_ec_prot_file = "vcst_rproteins.txt"
+
+# Q-score cutoff
+qscore_threshold = 0.35
+
+# Contact parameters
+lower_cutoff = 0.0
+upper_cutoff = 4.0
+
+# --- FUNCTIONS ---
+
+def parse_alignment(alignment_file):
+    """
+    Parse Clustal alignment to build canonical index mapping.
+    """
+    alignment = AlignIO.read(alignment_file, "clustal")
+    seq_vc = alignment[1].seq  # Assuming VC is second
+    seq_ec = alignment[0].seq  # Assuming EC is first
+    mapping = {}
+    vc_idx = 0
+    ec_idx = 0
+    for i in range(len(seq_vc)):
+        vc_char = seq_vc[i]
+        ec_char = seq_ec[i]
+        if vc_char != "-":
+            vc_idx += 1
+        if ec_char != "-":
+            ec_idx += 1
+        if vc_char != "-" and ec_char != "-":
+            mapping[vc_idx] = ec_idx
+    print(f"Parsed {len(mapping)} aligned nucleotide pairs from Clustal alignment.")
+    return mapping
+
+def get_pdb_residues(pdb_file):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("pdb", pdb_file)
+    residues = defaultdict(set)
+    for model in structure:
+        for chain in model:
+            for res in chain:
+                residues[chain.id].add(res.id[1])
+    return residues
+
+def load_qscores(path):
+    qdict = {}
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.strip().split()
+            chain = parts[0]
+            resnum = int(parts[1])
+            q = float(parts[3])
+            qdict[(chain, resnum)] = q
+    return qdict
+
+def load_atoms(pdb_file):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("pdb", pdb_file)
+    atoms = []
+    for model in structure:
+        for chain in model:
+            for res in chain:
+                for atom in res:
+                    atoms.append({
+                        'chain': chain.id,
+                        'resi': res.id[1],
+                        'coord': atom.coord
+                    })
+    return atoms
+
+def compute_contact_matrix(rna_atoms, prot_atoms, excluded_rna, excluded_prot):
+    rna_residues = sorted(set((a['chain'], a['resi']) for a in rna_atoms if (a['chain'], a['resi']) not in excluded_rna))
+    prot_residues = sorted(set((a['chain'], a['resi']) for a in prot_atoms if (a['chain'], a['resi']) not in excluded_prot))
+    matrix = pd.DataFrame(0, index=[f"{c}:{r}" for c,r in rna_residues],
+                             columns=[f"{c}:{r}" for c,r in prot_residues])
+    for rna in rna_atoms:
+        rna_id = (rna['chain'], rna['resi'])
+        if rna_id in excluded_rna:
+            continue
+        rna_label = f"{rna['chain']}:{rna['resi']}"
+        for prot in prot_atoms:
+            prot_id = (prot['chain'], prot['resi'])
+            if prot_id in excluded_prot:
+                continue
+            prot_label = f"{prot['chain']}:{prot['resi']}"
+            dist = np.linalg.norm(rna['coord'] - prot['coord'])
+            if lower_cutoff <= dist <= upper_cutoff:
+                matrix.at[rna_label, prot_label] += 1
+    return matrix
+
+# --- MAIN EXECUTION ---
+
+print("Parsing canonical alignment...")
+alignment_mapping = parse_alignment(clustal_alignment_file)
+
+print("Loading residues modeled in PDBs...")
+vc_rna_residues = get_pdb_residues(vc_rna_pdb)
+ec_rna_residues = get_pdb_residues(ec_rna_pdb)
+
+print("Loading Q-scores...")
+q_vc_rna = load_qscores(qscore_vc_rna_file)
+q_ec_rna = load_qscores(qscore_ec_rna_file)
+q_vc_prot = load_qscores(qscore_vc_prot_file)
+q_ec_prot = load_qscores(qscore_ec_prot_file)
+
+# Map canonical numbering to PDB numbering, with logging of exclusions
+rna_mapping = {}
+rna_exclusions = []
+
+for vc_idx, ec_idx in alignment_mapping.items():
+    modeled_vc = vc_idx in vc_rna_residues["A"]
+    modeled_ec = ec_idx in ec_rna_residues["A"]
+
+    if not modeled_vc or not modeled_ec:
+        reason = "Unmodeled"
+        rna_exclusions.append((vc_idx, ec_idx, reason))
+        continue
+
+    q_vc = q_vc_rna.get(("A", vc_idx), 0)
+    q_ec = q_ec_rna.get(("A", ec_idx), 0)
+
+    if q_vc < qscore_threshold or q_ec < qscore_threshold:
+        reason = "Low Q-score"
+        rna_exclusions.append((vc_idx, ec_idx, reason))
+        continue
+
+    rna_mapping[vc_idx] = ec_idx
+
+print(f"Total retained nucleotides after Q filtering: {len(rna_mapping)}")
+
+# Build protein exclusion set with logging
+excluded_prot = set()
+prot_exclusions = []
+
+all_prot_residues = set(q_vc_prot.keys()).union(set(q_ec_prot.keys()))
+for k in all_prot_residues:
+    q_vc = q_vc_prot.get(k, 0)
+    q_ec = q_ec_prot.get(k, 0)
+    if q_vc < qscore_threshold or q_ec < qscore_threshold:
+        excluded_prot.add(k)
+        prot_exclusions.append((k[0], k[1], "Low Q-score"))
+
+print(f"Excluded protein residues: {len(excluded_prot)}")
+
+print("Loading atoms...")
+rna_atoms_vc = load_atoms(vc_rna_pdb)
+prot_atoms_vc = load_atoms(vc_prot_pdb)
+rna_atoms_ec = load_atoms(ec_rna_pdb)
+prot_atoms_ec = load_atoms(ec_prot_pdb)
+
+print("Computing contact matrices...")
+matrix_vc = compute_contact_matrix(rna_atoms_vc, prot_atoms_vc, excluded_rna=set(), excluded_prot=excluded_prot)
+matrix_ec = compute_contact_matrix(rna_atoms_ec, prot_atoms_ec, excluded_rna=set(), excluded_prot=excluded_prot)
+
+# Align matrices by VC numbering, restrict to common protein residues only
+vc_labels = [f"A:{v}" for v in rna_mapping.keys()]
+ec_labels = [f"A:{rna_mapping[v]}" for v in rna_mapping.keys()]
+
+aligned_vc = matrix_vc.loc[vc_labels]
+aligned_ec = matrix_ec.loc[ec_labels]
+aligned_ec.index = vc_labels  # Use VC numbering
+
+# Identify common protein residues
+common_columns = aligned_vc.columns.intersection(aligned_ec.columns)
+
+# Restrict to common columns only
+aligned_vc = aligned_vc[common_columns]
+aligned_ec = aligned_ec[common_columns]
+
+# Compute delta
+delta = aligned_vc - aligned_ec
+
+print("Saving delta contact matrix...")
+delta.to_csv("delta_contact_matrix.csv")
+
+print("Saving residue mapping...")
+with open("residue_mapping.txt", "w") as f:
+    f.write("VC_residue\tEC_residue\n")
+    for vc_idx in sorted(rna_mapping.keys()):
+        f.write(f"{vc_idx}\t{rna_mapping[vc_idx]}\n")
+
+print("Saving nucleotide exclusion log...")
+with open("excluded_nucleotides.txt", "w") as f:
+    f.write("VC_residue\tEC_residue\tReason\n")
+    for v, e, reason in rna_exclusions:
+        f.write(f"{v}\t{e}\t{reason}\n")
+
+print("Saving protein exclusion log...")
+with open("excluded_proteins.txt", "w") as f:
+    f.write("Chain\tResNum\tReason\n")
+    for chain, resnum, reason in prot_exclusions:
+        f.write(f"{chain}\t{resnum}\t{reason}\n")
+
+print("Done.")

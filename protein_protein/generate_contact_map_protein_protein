@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import pandas as pd
+from Bio import AlignIO
+from Bio.PDB import PDBParser
+from collections import defaultdict
+from scipy.spatial.distance import cdist
+
+# -----------------
+# USER PARAMETERS
+# -----------------
+
+# Input files
+pdb1 = "vcmut_rproteins.pdb"
+pdb2 = "vcst_rproteins.pdb"
+
+qscore_file1 = "vcs44_rproteins.txt"
+qscore_file2 = "vcst_rproteins.txt"
+
+# Alignment files for each chain
+alignment_files = {
+    "B": "alignments/B.aln",
+    "C": "alignments/C.aln",
+    "D": "alignments/D.aln",
+    "E": "alignments/E.aln",
+    "F": "alignments/F.aln",
+    "G": "alignments/G.aln",
+    "H": "alignments/H.aln",
+    "I": "alignments/I.aln",
+    "J": "alignments/J.aln",
+    "K": "alignments/K.aln",
+    "L": "alignments/L.aln",
+    "M": "alignments/M.aln",
+    "N": "alignments/N.aln",
+    "O": "alignments/O.aln",
+    "P": "alignments/P.aln",
+    "Q": "alignments/Q.aln",
+    "R": "alignments/R.aln",
+    "S": "alignments/S.aln",
+    "T": "alignments/T.aln",
+    "U": "alignments/U.aln"
+}
+
+qscore_threshold = 0.4
+distance_cutoff = 4.0
+
+# -----------------
+# FUNCTIONS
+# -----------------
+
+def load_qscores(path):
+    qdict = {}
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.strip().split()
+            chain = parts[0]
+            resnum = int(parts[1])
+            qavg = float(parts[3])
+            qdict[(chain, resnum)] = qavg
+    return qdict
+
+def parse_alignment(aln_file):
+    alignment = AlignIO.read(aln_file, "clustal")
+    seq1 = alignment[0].seq
+    seq2 = alignment[1].seq
+    mapping = {}
+    idx1 = 0
+    idx2 = 0
+    for i in range(len(seq1)):
+        if seq1[i] != "-":
+            idx1 += 1
+        if seq2[i] != "-":
+            idx2 += 1
+        if seq1[i] != "-" and seq2[i] != "-":
+            mapping[idx1] = idx2
+    return mapping
+
+def load_residue_coords(pdb_file):
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("pdb", pdb_file)
+    residues = defaultdict(dict)
+    for model in structure:
+        for chain in model:
+            for res in chain:
+                atoms = []
+                for atom in res:
+                    atoms.append(atom.coord)
+                residues[chain.id][res.id[1]] = np.array(atoms)
+    return residues
+
+# -----------------
+# MAIN
+# -----------------
+
+print("Loading Q-scores...")
+q1 = load_qscores(qscore_file1)
+q2 = load_qscores(qscore_file2)
+
+print("Loading PDB residues...")
+res1 = load_residue_coords(pdb1)
+res2 = load_residue_coords(pdb2)
+
+chains1 = set(res1.keys())
+chains2 = set(res2.keys())
+if chains1 != chains2:
+    raise ValueError("Chain IDs do not match between the two structures!")
+
+print("Chains found:", sorted(chains1))
+
+# Load all alignments
+print("Parsing alignments...")
+alignments = {ch: parse_alignment(alignment_files[ch]) for ch in chains1}
+
+# Build mapping per chain
+mapping_per_chain = {}
+excluded_residues = []
+for ch in chains1:
+    mapping = {}
+    aln = alignments[ch]
+    resnums1 = set(res1[ch].keys())
+    resnums2 = set(res2[ch].keys())
+    for r1 in aln:
+        r2 = aln[r1]
+        modeled1 = r1 in resnums1
+        modeled2 = r2 in resnums2
+        if not (modeled1 and modeled2):
+            excluded_residues.append((ch, r1, r2, "Unmodeled"))
+            continue
+        qval1 = q1.get((ch, r1), 0)
+        qval2 = q2.get((ch, r2), 0)
+        if qval1 < qscore_threshold or qval2 < qscore_threshold:
+            excluded_residues.append((ch, r1, r2, "Low Q-score"))
+            continue
+        mapping[r1] = r2
+    mapping_per_chain[ch] = mapping
+
+# Initialize per-chain contact matrix
+all_chains = sorted(mapping_per_chain.keys())
+matrix = pd.DataFrame(0, index=all_chains, columns=all_chains)
+
+print("Computing chain–chain residue contacts (1 per residue pair)...")
+for ch1 in all_chains:
+    for ch2 in all_chains:
+        contact_count_1 = 0
+        contact_count_2 = 0
+        for r1 in mapping_per_chain[ch1]:
+            for r2 in mapping_per_chain[ch2]:
+                coords1_r1 = res1[ch1][r1]
+                coords1_r2 = res1[ch2][r2]
+                coords2_r1 = res2[ch1][mapping_per_chain[ch1][r1]]
+                coords2_r2 = res2[ch2][mapping_per_chain[ch2][r2]]
+
+                # Check structure1
+                d1 = cdist(coords1_r1, coords1_r2)
+                if np.any(d1 < distance_cutoff):
+                    contact_count_1 += 1
+
+                # Check structure2
+                d2 = cdist(coords2_r1, coords2_r2)
+                if np.any(d2 < distance_cutoff):
+                    contact_count_2 += 1
+
+        diff = contact_count_1 - contact_count_2
+        matrix.at[ch1, ch2] = diff
+
+print("Saving delta_contact_matrix.csv...")
+matrix.to_csv("delta_contact_matrix.csv")
+
+print("Saving excluded_residues.txt...")
+with open("excluded_residues.txt", "w") as f:
+    f.write("Chain\tRes1\tRes2\tReason\n")
+    for ch, r1, r2, reason in excluded_residues:
+        f.write(f"{ch}\t{r1}\t{r2}\t{reason}\n")
+
+print("Done.")
